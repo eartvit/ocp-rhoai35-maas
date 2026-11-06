@@ -363,13 +363,11 @@ except (ValueError,OSError): sys.exit(1)' || return 1
 }
 
 wait_mcg() {
-  local start=$SECONDS interval=20 reported=0
+  local start=$SECONDS interval=20
+  # AWS CredentialsRequests are diagnostics only; never wait for their Secret.
+  # Progress depends exclusively on the operational PV-backed MCG resources.
+  log 'Waiting for operational PV-backed MCG only; AWS credentials are NOT a prerequisite'
   until mcg_ready; do
-    if (( SECONDS - start >= MCG_CREDENTIAL_WAIT_SECONDS )) && (( reported == 0 )); then
-      mcg_credential_diagnostics
-      reported=1
-      warn 'Continuing to wait for PV-pool/NooBaa operational readiness; a failing AWS CredentialsRequest is not by itself fatal for this backend.'
-    fi
     if (( SECONDS - start >= READY_TIMEOUT )); then
       mcg_credential_diagnostics
       die 'Timeout: ODF standalone PV-pool MCG is not operational. Require NooBaa, StorageCluster, BackingStore, BucketClass Ready and the OBC StorageClass present. Inspect these resources before proceeding.'
@@ -749,7 +747,7 @@ enable_dashboard_features() {
   "automl":true,"disableLMEval":false,
   "observabilityDashboard":true,"gpuaas":true,
   "modelAsService":true,"vLLMDeploymentOnMaaS":true,
-  "llmdTemplates":true,"llmGatewayField":true
+  "llmdTemplates":true
 }}}
 JSON
 )
