@@ -1,4 +1,4 @@
-# RHOAI 3.5.x automation — AWS OpenShift 4.21/4.22
+# RHOAI 3.5.x automation — AWS OpenShift 4.22
 
 This package updates the **supplied** Bash installers for an OpenShift 4.22.18 / RHOAI 3.5.2 / RHCL 1.4.3 deployment and retains the experimental OCP 4.21 gate. No Helm, Argo CD or GitHub mutations. `--check` modes are read-only; `--apply` and `--prepare` mutate the cluster. All credentials stay outside configuration files.
 
