@@ -1,150 +1,332 @@
-# RHOAI 3.5.x automation — AWS OpenShift 4.22
+# OpenShift AI 3.5 on AWS OpenShift 4.22
 
-This package updates the **supplied** Bash installers for an OpenShift 4.22.18 / RHOAI 3.5.2 / RHCL 1.4.3 deployment and retains the experimental OCP 4.21 gate. No Helm, Argo CD or GitHub mutations. `--check` modes are read-only; `--apply` and `--prepare` mutate the cluster. All credentials stay outside configuration files.
+This guide walks through setting up Red Hat OpenShift AI (RHOAI) with Models as a Service (MaaS) and an optional Model Context Protocol (MCP) Gateway demonstration.
 
-**Support boundary:** OCP 4.22 was functionally validated manually in this lab; the revised scripts have passed local syntax checks but **have not been run end-to-end on a newly provisioned cluster**. The MCP operator comes from OperatorHub `preview` and some dashboard functions are tech preview. Do not treat the demo authorization as a production security certification: direct forbidden `tools/call` and spoofed-header tests were intentionally skipped.
+The installation uses Bash scripts and the OpenShift CLI (`oc`). Some model and MCP configuration is completed in the RHOAI and Keycloak web consoles.
 
-## Files and responsibilities
+## 1. Before you start
 
-- `setup-cluster.sh`, `.conf`, `rhoai-common.sh`: operator prerequisites; ODF standalone MCG/NooBaa; GPU; observability; RHOAI; MLflow.
-- `setup-maas.sh`, `.conf`: MaaS database/Gateway/Authorino TLS and native provider readiness, hardware profile. No LLM is automatically deployed.
-- `setup-mcp.sh`, `.conf`: **generic** MCP Gateway operator, two listeners and MCP Lifecycle; no demo backend or Keycloak policies.
-- `setup-mcp-demo.sh`, `.conf`: **demo-specific** preparation followed by post-UI Gateway federation and policies.
-- `admin-get-token.sh`, `user-get-token.sh`: clipboard token retrieval for controlled lab only.
-- `reset-odf-lab.sh`, `cleanup-noobaa.sh`: destructive, explicitly confirmed lab tools preserved from source. They are NOT part of normal setup.
+You will need:
 
-## 1. Baseline on a fresh OCP cluster
+- An AWS-based OpenShift 4.22 cluster and an OpenShift account with cluster-admin access.
+- A working OpenShift login. The scripts use your existing `oc` session.
+- `bash`, `python3`, `oc`, and `base64` on the machine running the scripts.
+- A configured OpenShift identity provider. The default configuration expects Keycloak/OpenID Connect.
+- An appropriate storage class for persistent volumes. The supplied configuration uses `gp3-csi`.
+- AWS capacity for the configured worker nodes and GPU instance type. The default GPU instance is `g6e.2xlarge` (one NVIDIA L40S).
+- Access to the RHOAI and Keycloak web consoles for the manual steps.
 
-Authenticate as OpenShift cluster admin and review `setup-cluster.conf`, especially storage class (`gp3-csi` on this lab), AWS region, worker MachineSets, GPU instance type and all operator channels. `ODF_CHANNEL=auto` selects the exact OpenShift minor's ODF channel (4.21 or 4.22). RHOAI uses `stable-3.5`. `MLFLOW_S3_REGION=default` is used for NooBaa S3.
+Run the commands from the directory containing the scripts. Review the `.conf` files before applying any configuration. In particular, confirm the worker count, GPU instance type, storage classes, ingress certificate, operator channels, and Keycloak settings.
+
+The scripts support two common modes:
+
+- `--check` checks prerequisites without applying changes.
+- `--apply` creates or updates the configured cluster resources.
+
+> **Important:** `reset-odf-lab.sh` and `cleanup-noobaa.sh` are destructive maintenance tools. They are not part of the normal installation procedure.
+
+### Files at a glance
+
+| File | Purpose |
+|---|---|
+| `setup-cluster.sh` / `setup-cluster.conf` | OpenShift AI baseline: operators, ODF/MCG, GPU, observability, and MLflow |
+| `rhoai-common.sh` | Shared functions used by the installation scripts |
+| `setup-maas.sh` / `setup-maas.conf` | MaaS database, gateway, Kuadrant, Authorino, and GPU hardware profile |
+| `setup-mcp.sh` / `setup-mcp.conf` | MCP Gateway operator and MCP infrastructure |
+| `setup-mcp-demo.sh` / `setup-mcp-demo.conf` | OpenShift MCP demo service prerequisites, gateway registration, and access policies |
+| `admin-get-token.sh`, `user-get-token.sh` | Obtain Keycloak access tokens for the demo |
+
+## 2. Install the OpenShift AI baseline
+
+First, authenticate to OpenShift and confirm that you are using the intended cluster:
+
+```bash
+oc whoami
+oc get clusterversion
+```
+
+Open `setup-cluster.conf` and review the settings. The default configuration targets RHOAI 3.5, uses `ODF_CHANNEL=auto` to select the ODF channel matching the OpenShift minor release, and provisions a standalone Multi-Cloud Gateway (MCG) backed by persistent volumes.
+
+Run:
 
 ```bash
 bash setup-cluster.sh --check
 bash setup-cluster.sh --apply
 ```
 
-**Updated ordering:** ODF operator installation is initiated first (using the correct catalog channel), followed by cert-manager and Service Mesh 3 **before RHCL**. The baseline does **not** prematurely create the Kuadrant custom resource: MaaS creates it after an accepted native GatewayClass exists and the Istio API CRDs are present. This avoids the observed `MissingDependency` reconciliation race. ODF StorageCluster/NooBaa is created or reused after installing operator prerequisites; wait for `NooBaa Ready`, `StorageCluster Ready`, PV-pool `BackingStore Ready`, `BucketClass Ready`, and the operator-generated `openshift-storage.noobaa.io` StorageClass before creating OBCs. No manual StorageClass creation.
+The installer provisions resources in this order:
 
-**CCO warning:** On both Red Hat lab clusters `openshift-storage/noobaa-aws-cloud-creds` reported missing `kube-system/aws-creds`, while ODF PV-pool/NooBaa and OBCs were operational on the second cluster. NooBaa readiness does NOT prove AWS credential minting. Do not copy Machine API credentials into `aws-creds`. The installer reports the CCO failure but does **not abort solely on AWS credentials** when the standalone MCG operational gate verifies NooBaa, StorageCluster, the PV-pool default BackingStore, default BucketClass, and their operator-generated ObjectBucket StorageClass. It checks for existing Bound OBCs and later **requires MLflow’s actual artifact OBC to become Bound**. Failure of any operational requirement remains fatal after the configured timeout. AWS-backed stores are not treated as a safe exception; never fabricate root AWS credentials.
+1. Confirms cluster access and the required CPU workers.
+2. Installs OpenShift Data Foundation (ODF), enables its console plugin, and provisions standalone MCG/NooBaa through an ODF `StorageCluster`.
+3. Waits for the PV-backed storage resources and ObjectBucket storage class to become available.
+4. Installs the remaining prerequisite operators.
+5. Creates the GPU MachineSet and waits for an allocatable NVIDIA GPU.
+6. Installs OpenShift AI and configures observability.
+7. Creates the MLflow database, artifact bucket claim, and MLflow instance.
+8. Enables the configured RHOAI dashboard features.
 
-The baseline also fixes the observability `OBS_PATCH` pipeline/environment propagation defect and checks existing MLflow OBC readiness.
+The default ObjectBucket storage class is `openshift-storage.noobaa.io`. The installer creates the MLflow artifact ObjectBucketClaim and requires it to reach `Bound`.
 
-## 2. MaaS
+At completion, check the core resources:
+
+```bash
+oc get nodes -L gpu.openshift.ai/accelerator
+oc get dsc,dsci
+oc get mlflow
+oc get storagecluster,noobaa,backingstore,bucketclass -n openshift-storage
+oc get obc -A
+```
+
+**Storage note:** Some AWS clusters cannot supply the root cloud credentials requested by NooBaa. The installer reports this separately from the PV-backed MCG checks. If you intend to use AWS-backed storage, resolve any credential provisioning warnings before configuring that storage.
+
+## 3. Install Models as a Service (MaaS)
+
+Review `setup-maas.conf`, particularly the gateway settings, MaaS database storage class, and GPU hardware profile values. GPU node selection is inherited from `setup-cluster.conf`.
 
 ```bash
 bash setup-maas.sh --check
 bash setup-maas.sh --apply
 ```
 
-MaaS creates the native GatewayClass/Gateway and initializes Kuadrant only after detecting GatewayClass acceptance and required Istio CRDs; if a pre-existing Kuadrant CR is stuck on `MissingDependency`, it requests **one** metadata reconciliation before waiting for `Ready`. No repeated operator restarts. The installer uses the verified system CA path `/etc/pki/tls/certs/ca-bundle.crt` for Authorino; the old path `/etc/ssl/certs/openshift-service-ca/service-ca-bundle.crt` was absent. The working MaaS Gateway includes the model-controller TLS EnvoyFilter to Authorino.
+This step configures:
 
-**Manual RHOAI UI:** deploy `gpt-oss-20b` through llm-d with the `nvidia-gpu` hardware profile. Set up MaaS subscription/API key and verify inference through Playground. For the 13-tool MCP workflow, the lab needed 32,000 tokens/minute (1,000 resulted in 429). On a one-GPU cluster, stop the model temporarily if NVIDIA validator pods need to run after a restart.
+- User workload monitoring and a CloudNativePG database for MaaS.
+- The OpenShift Gateway API resources and MaaS gateway hostname.
+- Kuadrant, Authorino, and authorization-service TLS.
+- The RHOAI MaaS component and default tenant.
+- A `nvidia-gpu` hardware profile for model serving.
 
-## 3. Generic MCP infrastructure
+The script prepares MaaS infrastructure but **does not deploy a model or create an API subscription**.
+
+### Deploy a model
+
+In the **OpenShift AI dashboard**:
+
+1. Open **AI hub → Models** and select the model to deploy (for example, `gpt-oss-20b`).
+2. Follow **Deploy model** and enter the model deployment details.
+3. Under **Deployment method**, choose **LLM inference service with llm-d**.
+4. Select **Single node** if deploying on the configured single-GPU node, and choose the `nvidia-gpu` hardware profile.
+5. In **Advanced settings**, choose the relevant model publishing and token-authentication options, including **Publish as MaaS** when appropriate.
+6. Review and deploy the model. Wait until its inference service is ready.
+7. Open **MaaS governance** to configure the required subscription and API key, then test an inference request.
+
+If the MaaS governance menu or publishing option does not appear immediately after the MaaS installation, refresh the RHOAI dashboard before investigating the cluster configuration.
+
+## 4. Install the MCP Gateway
+
+The MCP Gateway is optional and can be installed after the MaaS infrastructure is ready.
+
+Review `setup-mcp.conf`, then run:
 
 ```bash
 bash setup-mcp.sh --check
 bash setup-mcp.sh --apply
 ```
 
-The Gateway uses `openshift-default`, the HTTPS listener `mcp:443` with wildcard `*.apps.<cluster-domain>`, and the additional HTTP listener `mcps:8080` with `mcp-internal.mcp.local`. Both are preserved. `MCPGatewayExtension` has `privateHost=https://mcp-gateway-openshift-default.mcp-system.svc.cluster.local:443` (configurable) and `publicHost=mcp.<apps-domain>`. Catalog selects the latest offered MCP Gateway Operator CSV in the `preview` channel. The 4.21 allowance is explicitly experimental and may not support federation.
+The installer configures the MCP Gateway operator, Gateway API resources, and MCP Lifecycle components. The gateway exposes:
 
-`mcps:8080` is **not necessarily private** simply because its hostname says `internal`: assess Service/LoadBalancer and firewall exposure before sensitive use.
+| Listener | Purpose |
+|---|---|
+| HTTPS `mcp:443` | Public MCP Gateway endpoint |
+| HTTP `mcps:8080` | Additional MCP listener for internal routing configurations |
 
-**MCP demo step order:** RHOAI UI creates `ocp-mcp-demo` → `--prepare` configures only prerequisites → RHOAI Catalog deploys `test-ocp-mcp` → RHOAI Registry UI registers the direct server → Keycloak UI configures `mcp-gateway` → `--check` / `--apply` configure federation and publish Playground entries → RHOAI Registry UI registers the Gateway → validate Playground.
+The public MCP endpoint is printed by the script and follows this pattern:
 
-## 4. Create RHOAI project in the UI, then prepare prerequisites
+```text
+https://mcp.apps.<cluster-domain>/mcp
+```
 
-**Required sequence: create the AI project manually first.** In **RHOAI → Projects → Create project**, create `ocp-mcp-demo`. Do not create the namespace through `oc create namespace`; the RHOAI UI must recognize it as an AI project (`opendatahub.io/dashboard=true`).
+The MCP Gateway operator is installed from its configured OperatorHub channel (the supplied configuration uses `preview`). The name of an internal listener does not, by itself, restrict network access; review gateway and network exposure for your environment.
 
-Once the project appears in the RHOAI Projects list:
+## 5. Prepare the OpenShift MCP demo
+
+The following steps deploy an OpenShift MCP server and connect it to the MCP Gateway with Keycloak-based access controls.
+
+### Step 5.1 — Create the RHOAI project
+
+In the **OpenShift AI dashboard**:
+
+1. Open **Projects → Create project**.
+2. Create a project named `ocp-mcp-demo`.
+3. Confirm it appears in the RHOAI projects list.
+
+Create the project through the RHOAI dashboard so it is registered as an AI project.
+
+### Step 5.2 — Prepare the service account and permissions
+
+Run:
 
 ```bash
 bash setup-mcp-demo.sh --prepare
 ```
 
-This stage **requires the existing RHOAI project** and prepares only the `mcp-viewer` ServiceAccount, namespace-scoped `view` RoleBindings in `ocp-mcp-demo` and `llm-test`, and the ConfigMap `openshift-mcp-server-config` with `config.toml`. It also grants narrowly scoped cluster-wide `get/list` of **namespace metadata** for `ocp_namespaces_list`. This backend permission is shared by both Keycloak users; tool-level authorization needs independent validation for production. Secret access and write permissions are not granted.
+This prepares the `mcp-viewer` ServiceAccount, its read-only permissions for the demo namespaces, and the `openshift-mcp-server-config` ConfigMap. It also grants the namespace metadata access needed by the demo's namespace-listing tool.
 
-**No MCP server is deployed, no Registry entry is created, and no Playground MCP endpoint is published by `--prepare`.** These are intentionally deferred so the UI cannot advertise an undeployed server. The RHOAI MCP Registry is configured manually in the UI; Playground discovery uses `redhat-ods-applications/gen-ai-aa-mcp-servers`, which `--apply` populates after successful federation.
+The preparation stage does not deploy the MCP server. Do that in the RHOAI interface next.
 
-### Manual UI: deploy the backend
+### Step 5.3 — Deploy the MCP server
 
-In **RHOAI → AI hub → MCP servers → Catalog**, choose Red Hat `openshift-mcp-server` v0.4 and **Deploy MCP server**:
+In **RHOAI → AI hub → MCP servers → Catalog**, select the Red Hat **OpenShift MCP server** and choose **Deploy MCP server**.
 
-| Field | Value |
+Use these values:
+
+| Setting | Value |
 |---|---|
 | Deployment name | `test-ocp-mcp` |
 | Project | `ocp-mcp-demo` |
-| OCI image | Catalog default (`openshift-mcp-server-rhel9:0.4`) |
-| Port/path | `8080`, `/mcp` |
-| Runtime security ServiceAccount | `mcp-viewer` |
-| ConfigMap mount | `/etc/mcp-config` from `openshift-mcp-server-config` |
-| Config arguments | `--config /etc/mcp-config/config.toml` |
+| Image | Catalog default OpenShift MCP server image (v0.4) |
+| Port | `8080` |
+| MCP path | `/mcp` |
+| ServiceAccount | `mcp-viewer` |
+| ConfigMap | `openshift-mcp-server-config` |
+| ConfigMap mount path | `/etc/mcp-config` |
+| Configuration arguments | `--config /etc/mcp-config/config.toml` |
 
-`runtime.security.serviceAccountName: mcp-viewer` must appear in the YAML editor. Click Deploy. Wait for `MCPServer Ready=True, Accepted=True` and verify a Service/EndpointSlice for port 8080.
+In the YAML editor, confirm that the runtime uses `serviceAccountName: mcp-viewer`. Deploy the server and confirm it reaches **Ready**.
 
-Then in **RHOAI UI → AI hub → MCP servers → Registry → Create MCP server**, create the *direct* backend entry with display name `OpenShift MCP Demo`, `Active` status, and:
+### Step 5.4 — Register the direct MCP server
+
+In **RHOAI → AI hub → MCP servers → Registry**, create an **Active** entry with display name **OpenShift MCP Demo** and this server definition:
 
 ```json
-{"name":"org.redhat/openshift-mcp-demo","version":"0.4.0","description":"Read-only OpenShift MCP demo","remotes":[{"type":"streamable-http","url":"http://test-ocp-mcp.ocp-mcp-demo.svc.cluster.local:8080/mcp"}]}
+{
+  "name": "org.redhat/openshift-mcp-demo",
+  "version": "0.4.0",
+  "description": "Read-only OpenShift MCP demo",
+  "remotes": [
+    {
+      "type": "streamable-http",
+      "url": "http://test-ocp-mcp.ocp-mcp-demo.svc.cluster.local:8080/mcp"
+    }
+  ]
+}
 ```
 
-The Registry entry is now present in the RHOAI UI, but the **Playground discovery entry is deliberately not published yet**. Do not expect to see or authorize `OpenShift-MCP-Demo` in Playground before `--apply`. The direct endpoint remains intended for validation, and should be unselected when testing the protected Gateway.
+This registers the backend directly. The gateway integration is configured in a later step.
 
-## 5. Manual Keycloak setup BEFORE demo post-install
+## 6. Configure Keycloak for MCP access
 
-Reuse the existing OpenShift `rhbk` Keycloak `sso` realm. Confirm ordinary users `admin` and `user1` exist; `temp-admin` is used only for the Keycloak admin console. Keycloak admin-console access is not required by these regular users.
+Use the existing Keycloak instance and the `sso` realm. The demo uses ordinary realm users named `admin` and `user1`, distinct from any temporary Keycloak administration account.
 
-In **Keycloak → Clients → Create client**:
+In **Keycloak → Clients → Create client**, configure:
 
-- OpenID Connect client ID `mcp-gateway`; public client (Client authentication Off); Standard Flow On, PKCE `S256`, Implicit Off.
-- For the **lab only**, enable **Direct access grants** to retrieve a token via curl; don't enable it in production. Redirect URIs can remain empty for this lab password-grant workflow; add exact callback URIs if later enabling interactive browser login.
-- Under **Advanced → Access Token Lifespan**, set 1 day. In this lab the response was **36,000 seconds (10 hours)** due to other Keycloak limits; no realm-wide change is needed.
-- Under **Client scopes → mcp-gateway-dedicated → Configure a new mapper → Audience**, set name `mcp-gateway-audience`, Included Client Audience `mcp-gateway`, Add to access token On, Add to ID token Off.
-- A new token should have `iss=https://sso.apps.<cluster-domain>/realms/sso`, `aud=mcp-gateway`, `azp=mcp-gateway`, and `preferred_username` of `admin` or `user1`. Their Keycloak roles may differ; this lab uses **direct username matching**, not groups.
+| Setting | Value |
+|---|---|
+| Client type | OpenID Connect |
+| Client ID | `mcp-gateway` |
+| Client authentication | Off (public client) |
+| Standard flow | On |
+| PKCE | `S256` |
+| Implicit flow | Off |
+| Direct access grants | On, for this lab's token helper scripts |
 
-Do not store passwords or access tokens in these files.
+Under **Client scopes → mcp-gateway-dedicated**, add an **Audience** mapper:
 
-## 6. Post-UI federation, JWT and Playground integration
+| Setting | Value |
+|---|---|
+| Mapper name | `mcp-gateway-audience` |
+| Included Client Audience | `mcp-gateway` |
+| Add to access token | On |
+| Add to ID token | Off |
 
-After the RHOAI Catalog deployment, the manual **direct MCP Registry** entry, and Keycloak setup are complete, run:
+The gateway expects access tokens issued by the realm, including the `mcp-gateway` audience. The demo's user-based policies distinguish `admin` and `user1`.
+
+For lab use, configure an appropriate access-token lifespan under the client's advanced settings. The supplied demo uses password-based token retrieval; keep **Direct access grants disabled in production** and use an appropriate interactive or machine-to-machine flow there.
+
+Do not place Keycloak passwords or access tokens in `.conf` files.
+
+## 7. Configure MCP Gateway federation and policies
+
+After the MCP server is deployed and registered in the RHOAI Registry, and the Keycloak client is ready, run:
 
 ```bash
 bash setup-mcp-demo.sh --check
 bash setup-mcp-demo.sh --apply
 ```
 
-The second stage creates/reconciles these tested resources:
+The script configures the backend route, MCP server registration, virtual servers, Keycloak JWT authentication, tool authorization policies, gateway routing, and Playground MCP discovery.
 
-1. Backend HTTPRoute `mcp-system/test-ocp-mcp-backend`, parent `mcp` (public HTTPS listener), hostname `test-ocp-mcp.<apps-domain>`, cross-namespace ReferenceGrant to `ocp-mcp-demo/test-ocp-mcp:8080`.
-2. A **RequestHeaderModifier removing `Authorization`** on backend forwarding. Without it, the backend MCP server can substitute the incoming Keycloak JWT for its Kubernetes ServiceAccount token, leading to `the server has asked for the client to provide credentials`.
-3. `MCPServerRegistration/test-ocp-mcp`, prefix `ocp_`, `userSpecificList: Disabled`. Require Ready and `discoveredTools=13`; `servers` in the operator-managed `mcp-gateway-config` must contain the backend.
-4. `admin-tools` MCPVirtualServer (all 13 federated tool names) and `user1-tools` (`ocp_pods_get`, `ocp_pods_list_in_namespace`, `ocp_pods_log`). Wait for both to appear in the controller-managed Secret. **Do not manually patch the Secret** when native reconciliation succeeds.
-5. MCP-specific `mcp-gateway-authn-ssl` EnvoyFilter with `priority: -1`, Authorino gRPC destination 50051 and TLS trust via `/var/run/secrets/kubernetes.io/serviceaccount/service-ca.crt` — adapted from the healthy MaaS filter. Authorino TLS stays enabled.
-6. Gateway Keycloak JWT AuthPolicy, verified usernames and `x-mcp-virtualserver` selection. Separate backend HTTPRoute AuthPolicy for `x-mcp-toolname` and allowed calls. Both require Accepted and Enforced. Gateway policy alone does **not** establish tool authorization.
-7. Passthrough OpenShift Route `mcp-gateway-playground` using the live apps domain and the Gateway-owned Service's HTTPS `mcp` port. This was necessary in the lab because `mcp.<apps-domain>` resolved to the standard OpenShift router, not the Gateway AWS LB. It is an ingress option, not strictly internal-only traffic; assess exposure for customers.
-8. Publish **both** `OpenShift-MCP-Demo` (direct backend) and `OpenShift-MCP-Gateway` to `gen-ai-aa-mcp-servers` only at this final stage. Preserve any unrelated existing entries.
+The two demo identities are configured with different tool selections:
 
-**RHOAI MCP Registry UI (after `--apply`):** create a second **Active** Registry entry, display name `OpenShift MCP Gateway`, with `server.json`:
+| User | Available MCP tools |
+|---|---|
+| `admin` | 13 OpenShift MCP tools |
+| `user1` | 3 tools: `ocp_pods_get`, `ocp_pods_list_in_namespace`, `ocp_pods_log` |
+
+### Register the MCP Gateway in RHOAI
+
+After the apply stage completes, return to **RHOAI → AI hub → MCP servers → Registry** and create a second **Active** entry:
+
+- **Display name:** `OpenShift MCP Gateway`
+- **Server definition:**
 
 ```json
-{"name":"org.redhat/openshift-mcp-gateway","version":"0.7.1","description":"Keycloak-authenticated MCP Gateway with per-user tool selection","remotes":[{"type":"streamable-http","url":"https://mcp.apps.<your-cluster-domain>/mcp"}]}
+{
+  "name": "org.redhat/openshift-mcp-gateway",
+  "version": "0.7.1",
+  "description": "Keycloak-authenticated MCP Gateway with per-user tool selection",
+  "remotes": [
+    {
+      "type": "streamable-http",
+      "url": "https://mcp.apps.<cluster-domain>/mcp"
+    }
+  ]
+}
 ```
 
-Replace the placeholder with the **live Gateway endpoint printed at the end of `setup-mcp-demo.sh --apply`**. On the validated cluster this was `https://mcp.apps.ocp.nbqpm.sandbox5271.opentlc.com/mcp`; a new cluster will have a different hostname. The script also prints a complete ready-to-paste Gateway `server.json`. Registry entries are created **manually through the RHOAI UI**, not by these scripts. Registry registration alone does not populate the Playground discovery ConfigMap.
+Replace `<cluster-domain>` with your cluster's actual applications domain. Prefer the complete Gateway URL printed by `setup-mcp-demo.sh --apply`.
 
-### Validation and RHOAI Playground
+The Registry entries are created in the RHOAI UI. The script separately publishes the demo endpoints for Playground discovery.
 
-1. Check the Route has `Admitted=True` and the public HTTPS URL without a token returns **401**. The Gateway backend authentication and tool authorization must be Enforced.
-2. Run `./user-get-token.sh user1` or `./admin-get-token.sh admin` from Fedora with `wl-copy` installed. Each script prompts securely for the ordinary Keycloak user password, discovers the live issuer from OpenShift OAuth, obtains an access token, and copies **only** the token (without `Bearer `) to the clipboard. `KC_URL`, `KC_REALM`, `KC_CLIENT` may override discovery/defaults.
-3. Open **RHOAI → AI Playground → Settings → MCP**, select `OpenShift-MCP-Gateway` and click **Authorize MCP server**. Paste the token. Unselect the direct `OpenShift-MCP-Demo` so it cannot bypass the Gateway. For `user1`, expect **3/3 tools**; ask GPT-OSS-20B to list pods in `llm-test` and expand the actual `ocp_pods_list_in_namespace` tool response.
-4. Disconnect/reconnect with `admin` token: expect **13/13 tools**, successful `ocp_namespaces_list` and `ocp_projects_list`. The `mcp-viewer-namespace-reader` ClusterRole created during `--prepare` is necessary for the former.
-5. Security caveat: manually constructing a forbidden `tools/call` request and spoofing client-supplied virtual-server/tool headers was **not performed** in the documented demonstration. Before customer use, validate this negative test and verify the backend policy matches the exact forwarding behavior of the operator. No `Enforced=True` condition alone is proof.
+## 8. Use the MCP demo in AI Playground
 
-## Operational notes
+1. Open **RHOAI → Gen AI studio → Playground** and choose the deployed model.
+2. Open the Playground's **Settings → MCP** section.
+3. Select **OpenShift-MCP-Gateway**. Deselect the direct **OpenShift-MCP-Demo** endpoint so requests go through the gateway policies.
+4. Choose **Authorize MCP server** and paste a Keycloak access token.
+5. Try an OpenShift question that requires an MCP tool, and inspect the tool call and response in the Playground.
 
-- Never copy machine provisioning IAM credentials into `kube-system/aws-creds` as a guess. The lab CCO's `MissingRootCredential` warning persisted even though standalone MCG and OBCs were Ready; track independently.
-- Do not change Gateway-managed HTTPRoute CRDs. OCP 4.21 lacked `HTTPRoute.spec.rules[].name`; OCP 4.22 has it, but manually adding the field did **not** fix registration. The successful federation change was public/private extension hosts plus wildcard matching and a backend route on `mcp:443`.
-- `MCPServerRegistration Ready=True` and tool discovery must be checked independently. In this lab: 13 tools, 1 prompt.
-- A model may fabricate an MCP error if it never executes a tool. Verify actual tool responses and backend logs.
-- Do not rerun destructive ODF cleanup scripts against a healthy system. Their `--check` modes inspect the destructive scope first.
-- Resource reconciliation uses `oc apply`, bounded waits, existing-resource checks and refuses critical conflicting resources wherever possible. The demo scripts are not intended to manage a customer-shared Gateway with different naming conventions.
+On a Fedora desktop with `wl-copy` available, the helper scripts can request a user token and place it on the clipboard:
+
+```bash
+./user-get-token.sh user1
+# or
+./admin-get-token.sh admin
+```
+
+The scripts prompt for the user's Keycloak password. Paste the resulting token into the authorization dialog **without** adding `Bearer `.
+
+For `user1`, the Gateway should expose three pod-inspection tools. For `admin`, it should expose all 13 configured OpenShift MCP tools. Confirm that the Playground actually invokes the expected tool and returns cluster data.
+
+The demo's backend ServiceAccount is read-only for its configured resources. Gateway authentication, virtual-server selection, and tool-level authorization are separate controls; review them before adapting this setup to a shared or production environment.
+
+## 9. Useful checks and maintenance
+
+Check the main OpenShift AI and MaaS resources:
+
+```bash
+oc get dsc,dsci
+oc get gateway -A
+oc get kuadrant -n kuadrant-system
+oc get maastenantconfig -n models-as-a-service
+oc get deployment maas-api -n redhat-ai-gateway-infra
+```
+
+Check storage and MLflow:
+
+```bash
+oc get storagecluster,noobaa,backingstore,bucketclass -n openshift-storage
+oc get obc -A
+oc get mlflow
+```
+
+Check the MCP resources:
+
+```bash
+oc get gateway -n mcp-system
+oc get mcpserverregistration,mcpvirtualserver -A
+```
+
+If a feature is missing immediately after installation, refresh the relevant RHOAI dashboard page and confirm that the corresponding resource is ready before making configuration changes.
+
+For an existing cluster, run the appropriate script's `--check` mode before any subsequent `--apply`. Avoid running the ODF cleanup utilities as part of routine maintenance.

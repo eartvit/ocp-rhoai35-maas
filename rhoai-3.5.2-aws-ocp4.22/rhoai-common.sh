@@ -13,7 +13,7 @@ wait_for() {
   local start=$SECONDS
   until "$@" >/dev/null 2>&1; do
     if (( SECONDS-start >= timeout )); then die "Timeout: $msg. Inspect resources and rerun."; fi
-    log "Waiting for $msg (${SECONDS} elapsed)"; sleep "$interval"
+    log "Waiting for $msg ($((SECONDS-start))s elapsed)"; sleep "$interval"
   done
   log "Ready: $msg"
 }

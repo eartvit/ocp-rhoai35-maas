@@ -187,13 +187,14 @@ spec:
   managementState: Managed
 YAML
 }
+install_odf_operator() {
+  yes "$ODF_ENABLED" || return 0
+  ensure_olm odf-operator openshift-storage "$ODF_CHANNEL" redhat-operators own
+  wait_crd noobaas.noobaa.io
+}
+
 install_prereqs() {
-  # ODF first: allows standalone MCG initialization while unrelated operators install.
-  # The actual StorageCluster is provisioned after prerequisite installation.
-  if yes "$ODF_ENABLED"; then
-    ensure_olm odf-operator openshift-storage "$ODF_CHANNEL" redhat-operators own
-    wait_crd noobaas.noobaa.io
-  fi
+  # Install non-ODF prerequisites only after ODF console and standalone MCG.
   yes "$CERT_MANAGER_ENABLED" && { ensure_olm openshift-cert-manager-operator cert-manager-operator stable-v1 redhat-operators own; wait_crd certificates.cert-manager.io; }
   # The Kuadrant instance must NOT be created before its Istio provider exists.
   # Service Mesh operator and CRDs precede RHCL. Actual Kuadrant CR creation is
@@ -332,50 +333,97 @@ except (ValueError, OSError): pass' || :)"
   fi
 }
 
-# Structural operational readiness of the *PV-backed* standalone MCG path.
-# Deliberately does not depend on NooBaa Available=True, which may reflect a
-# separate AWS credential-minting problem on the lab's CCO.
-mcg_ready() {
-  [[ "$(oc get noobaa noobaa -n openshift-storage -o jsonpath='{.status.phase}' 2>/dev/null || :)" == Ready ]] || return 1
-  [[ "$(oc get storagecluster ocs-storagecluster -n openshift-storage -o jsonpath='{.status.phase}' 2>/dev/null || :)" == Ready ]] || return 1
+# Operational readiness of the operator-managed, PV-backed standalone MCG path.
+# StorageCluster/NooBaa phase strings vary with ODF reconciliation and an
+# independent AWS CredentialsRequest may leave NooBaa in Configuring even when
+# the PV-backed bucket service is usable. Gate on the actual backend objects,
+# object-bucket provisioner and Ready core/endpoint pods instead. MLflow's OBC
+# is still required to reach Bound before the baseline is declared complete.
+mcg_components_ready() {
+  oc get storagecluster ocs-storagecluster -n openshift-storage >/dev/null 2>&1 || return 1
+  check_mcg_storagecluster || return 1
+  oc get noobaa noobaa -n openshift-storage >/dev/null 2>&1 || return 1
   [[ "$(oc get backingstore noobaa-default-backing-store -n openshift-storage -o jsonpath='{.status.phase}' 2>/dev/null || :)" == Ready ]] || return 1
   [[ "$(oc get bucketclass noobaa-default-bucket-class -n openshift-storage -o jsonpath='{.status.phase}' 2>/dev/null || :)" == Ready ]] || return 1
-  # Refuse to treat an arbitrary AWS-backed store as a local PV-pool.
+  # This is a standalone MCG with a PV-pool backend, not an arbitrary AWS store.
   oc get backingstore noobaa-default-backing-store -n openshift-storage -o json 2>/dev/null | python3 -c '
 import json,sys
 try:
-  spec=json.load(sys.stdin).get("spec",{})
-  sys.exit(0 if spec.get("type")=="pv-pool" and isinstance(spec.get("pvPool"),dict) else 1)
+ spec=json.load(sys.stdin).get("spec",{})
+ sys.exit(0 if spec.get("type")=="pv-pool" and isinstance(spec.get("pvPool"),dict) else 1)
 except (ValueError,OSError): sys.exit(1)' || return 1
   oc get bucketclass noobaa-default-bucket-class -n openshift-storage -o json 2>/dev/null | python3 -c '
 import json,sys
 try:
-  spec=json.load(sys.stdin).get("spec",{})
-  tiers=spec.get("placementPolicy",{}).get("tiers",[])
-  sys.exit(0 if any("noobaa-default-backing-store" in t.get("backingStores",[]) for t in tiers) else 1)
+ spec=json.load(sys.stdin).get("spec",{})
+ tiers=spec.get("placementPolicy",{}).get("tiers",[])
+ sys.exit(0 if any("noobaa-default-backing-store" in t.get("backingStores",[]) for t in tiers) else 1)
 except (ValueError,OSError,AttributeError): sys.exit(1)' || return 1
   oc get storageclass openshift-storage.noobaa.io -o json 2>/dev/null | python3 -c '
 import json,sys
 try:
-  sc=json.load(sys.stdin)
-  sys.exit(0 if sc.get("provisioner")=="openshift-storage.noobaa.io/obc" and sc.get("parameters",{}).get("bucketclass")=="noobaa-default-bucket-class" else 1)
+ sc=json.load(sys.stdin)
+ params=sc.get("parameters",{})
+ good=sc.get("provisioner")=="openshift-storage.noobaa.io/obc"
+ # Some ODF versions omit the explicit bucketclass parameter; if present,
+ # it must point to the bucket class whose readiness we verified above.
+ good=good and params.get("bucketclass","noobaa-default-bucket-class")=="noobaa-default-bucket-class"
+ sys.exit(0 if good else 1)
 except (ValueError,OSError): sys.exit(1)' || return 1
+}
+
+mcg_service_pods_ready() {
+  oc get pods -n openshift-storage -o json 2>/dev/null | python3 -c '
+import json,sys
+try:
+ pods=json.load(sys.stdin).get("items",[])
+ for prefix in ("noobaa-core-", "noobaa-endpoint-"):
+  matches=[p for p in pods if p.get("metadata",{}).get("name","").startswith(prefix)]
+  if not matches or not any(
+    p.get("status",{}).get("phase")=="Running" and
+    any(c.get("type")=="Ready" and c.get("status")=="True" for c in p.get("status",{}).get("conditions",[]))
+    for p in matches): sys.exit(1)
+except (ValueError,OSError): sys.exit(1)' || return 1
+}
+
+mcg_ready() {
+  mcg_components_ready && mcg_service_pods_ready
+}
+
+# Progress diagnostics report the concrete dependency that is not ready.
+mcg_readiness_diagnostics() {
+  local phase
+  phase="$(oc get noobaa noobaa -n openshift-storage -o jsonpath='{.status.phase}' 2>/dev/null || :)"
+  log "MCG status: NooBaa phase=${phase:-missing} (informational; not the PV-backed operational gate)"
+  phase="$(oc get storagecluster ocs-storagecluster -n openshift-storage -o jsonpath='{.status.phase}' 2>/dev/null || :)"
+  log "MCG status: StorageCluster phase=${phase:-missing} (informational)"
+  phase="$(oc get backingstore noobaa-default-backing-store -n openshift-storage -o jsonpath='{.status.phase}' 2>/dev/null || :)"
+  [[ "$phase" == Ready ]] || log "MCG pending: PV BackingStore phase=${phase:-missing} (expected Ready)"
+  phase="$(oc get bucketclass noobaa-default-bucket-class -n openshift-storage -o jsonpath='{.status.phase}' 2>/dev/null || :)"
+  [[ "$phase" == Ready ]] || log "MCG pending: BucketClass phase=${phase:-missing} (expected Ready)"
+  if ! mcg_components_ready; then
+    log 'MCG pending: StorageCluster/NooBaa existence, standalone PV-pool backing, BucketClass placement or OBC StorageClass configuration'
+  fi
+  if ! mcg_service_pods_ready; then
+    log 'MCG pending: Ready noobaa-core and noobaa-endpoint pods'
+  fi
 }
 
 wait_mcg() {
   local start=$SECONDS interval=20
   # AWS CredentialsRequests are diagnostics only; never wait for their Secret.
   # Progress depends exclusively on the operational PV-backed MCG resources.
-  log 'Waiting for operational PV-backed MCG only; AWS credentials are NOT a prerequisite'
+  log "Waiting up to ${MCG_READY_TIMEOUT_SECONDS}s for operational PV-backed MCG; AWS credential minting is diagnosed separately"
   until mcg_ready; do
-    if (( SECONDS - start >= READY_TIMEOUT )); then
+    if (( SECONDS - start >= MCG_READY_TIMEOUT_SECONDS )); then
       mcg_credential_diagnostics
-      die 'Timeout: ODF standalone PV-pool MCG is not operational. Require NooBaa, StorageCluster, BackingStore, BucketClass Ready and the OBC StorageClass present. Inspect these resources before proceeding.'
+      die 'Timeout: ODF standalone PV-pool MCG operational readiness. Inspect BackingStore, BucketClass, OBC StorageClass, NooBaa core/endpoint pods and recent MCG diagnostics.'
     fi
-    log "Waiting for ODF standalone PV-pool MCG operational readiness (${SECONDS-start} elapsed)"
+    log "Waiting for ODF standalone PV-pool MCG operational readiness ($((SECONDS-start))s elapsed)"
+    mcg_readiness_diagnostics
     sleep "$interval"
   done
-  log 'Ready: standalone NooBaa, StorageCluster, PV-pool BackingStore, BucketClass and OBC StorageClass'
+  log 'Ready: PV-backed MCG core/endpoint pods, BackingStore, BucketClass and OBC StorageClass (MLflow OBC binding follows)'
   # Emit warnings even when the operational gate passes immediately on a rerun.
   mcg_credential_diagnostics
   local bound
@@ -767,9 +815,11 @@ main() {
   [[ "$MODE" == apply ]] || return 0
   configure_htpasswd
   scale_cpu_workers
-  install_prereqs
+  # ODF and standalone MCG follow the Console setup sequence before all other operators.
+  install_odf_operator
   enable_odf_console
   provision_mcg
+  install_prereqs
   make_gpu_machineset
   install_observability_operators
   rhoai_base

@@ -231,6 +231,29 @@ YAML
 # After the native OpenShift GatewayClass has been Accepted and required Istio
 # APIs served, create Kuadrant. Existing instances are preserved.
 kuadrant_ready() { check_ready_condition kuadrant "$KUADRANT_NAME" "$KUADRANT_NS"; }
+# Diagnostic-only wrapper: preserve the existing Kuadrant readiness decision.
+# Report changed Ready conditions while the standard wait_for timeout/polling
+# controls remain untouched.
+KUADRANT_LAST_DIAGNOSTIC=''
+kuadrant_ready_with_diagnostics() {
+  if kuadrant_ready; then return 0; fi
+  local detail
+  detail="$(oc get kuadrant "$KUADRANT_NAME" -n "$KUADRANT_NS" -o json 2>/dev/null | python3 -c '
+import json,sys
+try:
+  conditions=json.load(sys.stdin).get("status",{}).get("conditions",[])
+  ready=next((c for c in conditions if c.get("type")=="Ready"), None)
+  print("Ready status={}; reason={}; message={}".format(
+      ready.get("status","unknown"),ready.get("reason","unknown"),ready.get("message","")) if ready else "Ready condition not yet reported")
+except (ValueError, OSError):
+  print("Kuadrant CR status unavailable")
+' 2>/dev/null || :)"
+  if [[ "$detail" != "$KUADRANT_LAST_DIAGNOSTIC" ]]; then
+    warn "Kuadrant not ready: $detail" 2>&3
+    KUADRANT_LAST_DIAGNOSTIC="$detail"
+  fi
+  return 1
+}
 ensure_kuadrant_after_provider() {
   wait_for 'GatewayClass accepted' "$READY_TIMEOUT" 10 gatewayclass_accepted
   for crd in envoyfilters.networking.istio.io wasmplugins.extensions.istio.io peerauthentications.security.istio.io; do wait_crd "$crd"; done
@@ -255,7 +278,7 @@ YAML
       oc annotate kuadrant "$KUADRANT_NAME" -n "$KUADRANT_NS" "automation.rhoai.io/provider-reconcile=$(date +%s)" --overwrite
     fi
   fi
-  wait_for 'Kuadrant Ready' "$READY_TIMEOUT" 10 kuadrant_ready
+  wait_for 'Kuadrant Ready' "$READY_TIMEOUT" 10 kuadrant_ready_with_diagnostics 3>&2
 }
 gatewayclass_accepted() { [[ "$(oc get gatewayclass "$GATEWAY_CLASS" -o jsonpath='{.status.conditions[?(@.type=="Accepted")].status}' 2>/dev/null)" == True ]]; }
 
